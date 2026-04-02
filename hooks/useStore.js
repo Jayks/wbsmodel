@@ -8,11 +8,38 @@ export const useStore = () => {
     offshoreRatio: 0.83,
     workingDays: 21,
     hoursPerDay: 8,
-    bufferPercent: 0.05
+    bufferPercent: 0.05,
+    scopeCreep: 0.0,
+    costingMethod: 'global'
   });
   const [wbsItems, setWbsItems] = useState([]);
+  const [savedScenarios, setSavedScenarios] = useState([]);
 
-  // Action: Replace WBS data with new RFP import
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const keys = Object.keys(localStorage).filter(k => k.startsWith('wbs-scenario-')).map(k => k.replace('wbs-scenario-', ''));
+      setSavedScenarios(keys);
+    }
+  }, []);
+
+  const saveScenario = (name) => {
+    const data = { rateCard, deliveryModel, wbsItems };
+    localStorage.setItem(`wbs-scenario-${name}`, JSON.stringify(data));
+    if (!savedScenarios.includes(name)) {
+      setSavedScenarios([...savedScenarios, name]);
+    }
+  };
+
+  const loadScenario = (name) => {
+    const data = localStorage.getItem(`wbs-scenario-${name}`);
+    if (data) {
+      const parsed = JSON.parse(data);
+      setRateCard(parsed.rateCard);
+      setDeliveryModel(parsed.deliveryModel);
+      setWbsItems(parsed.wbsItems);
+    }
+  };
+
   const importWbsData = (items) => {
     const formattedItems = items.map(item => ({
       ...item,
@@ -21,12 +48,10 @@ export const useStore = () => {
     setWbsItems(formattedItems);
   };
 
-  // Initialization
   useEffect(() => {
     try {
       if (!modelData || !modelData.Assumptions) return;
 
-      // Parse Rate Card (Roles are in rows 4-11 of Assumptions sheet)
       const firstRow = modelData.Assumptions[0];
       const mainKey = Object.keys(firstRow)[0];
 
@@ -41,7 +66,6 @@ export const useStore = () => {
       }));
       setRateCard(roles);
 
-      // Parse WBS Detail
       const wbsSheet = modelData["WBS Detail"];
       if (wbsSheet) {
         const initialWbs = wbsSheet.map((row) => {
@@ -59,7 +83,6 @@ export const useStore = () => {
           };
         }).filter(item => item.id && item.deliverable && /^\d/.test(item.id));
 
-        // Extract precise delivery parameters from Assumptions
         const assumptions = modelData.Assumptions || [];
         const offshoreRow = assumptions.find(r => r["WBS Cost Model — Assumptions & Rate Card"]?.toString().includes("Offshore ratio"));
         const bufferRow = assumptions.find(r => r["WBS Cost Model — Assumptions & Rate Card"]?.toString().includes("buffer %"));
@@ -70,7 +93,9 @@ export const useStore = () => {
           offshoreRatio: parseFloat(offshoreRow?.["Unnamed: 1"]) || 0.83,
           bufferPercent: parseFloat(bufferRow?.["Unnamed: 1"]) || 0.05,
           workingDays: parseFloat(daysRow?.["Unnamed: 1"]) || 21,
-          hoursPerDay: parseFloat(hoursRow?.["Unnamed: 1"]) || 8
+          hoursPerDay: parseFloat(hoursRow?.["Unnamed: 1"]) || 8,
+          scopeCreep: 0.0,
+          costingMethod: 'global'
         };
 
         setWbsItems(initialWbs);
@@ -98,7 +123,7 @@ export const useStore = () => {
       id: `${prefix}${maxSubId + 1}`,
       deliverable: 'New Deliverable Unit',
       phase: '1',
-      role: 'Data/Analytics Engineer',
+      role: rateCard.length > 0 ? rateCard[0].role : 'Data/Analytics Engineer',
       offshoreRatio: 0.8,
       effort: 0,
       isLeaf: true
@@ -112,40 +137,90 @@ export const useStore = () => {
     });
   };
 
-  // Calculations
+  const addRateItem = () => {
+    setRateCard(prev => {
+      const _id = prev.length ? Math.max(...prev.map(p => p.id)) + 1 : 1;
+      return [...prev, {
+        id: _id,
+        role: 'New Persona',
+        onshoreHr: 0,
+        offshoreHr: 0,
+        onshorePd: 0,
+        offshorePd: 0,
+        notes: ''
+      }];
+    });
+  };
+
+  const deleteRateItem = (id) => {
+    setRateCard(prev => prev.filter(r => r.id !== id));
+  };
+
   const metrics = useMemo(() => {
     const avgOnshoreHr = rateCard.reduce((acc, r) => acc + (parseFloat(r.onshoreHr) || 0), 0) / (rateCard.length || 1);
     const offshoreRolesList = rateCard.filter(r => r.offshoreHr && r.offshoreHr !== '—' && parseFloat(r.offshoreHr) > 0);
     const avgOffshoreHr = offshoreRolesList.reduce((acc, r) => acc + (parseFloat(r.offshoreHr) || 0), 0) / (offshoreRolesList.length || 1);
     
-    const blendedRateHr = (avgOnshoreHr * (1 - deliveryModel.offshoreRatio)) + (avgOffshoreHr * deliveryModel.offshoreRatio);
-    const blendedRate = blendedRateHr * deliveryModel.hoursPerDay;
+    const globalBlendedRateHr = (avgOnshoreHr * (1 - deliveryModel.offshoreRatio)) + (avgOffshoreHr * deliveryModel.offshoreRatio);
+    const globalBlendedRate = globalBlendedRateHr * deliveryModel.hoursPerDay;
 
-    const totalEffortBase = wbsItems.filter(i => i.isLeaf).reduce((acc, item) => acc + (parseFloat(item.effort) || 0), 0);
+    const mult = 1 + (deliveryModel.scopeCreep || 0.0);
     
+    const totalEffortBase = wbsItems.filter(i => i.isLeaf).reduce((acc, item) => acc + (parseFloat(item.effort) || 0) * mult, 0);
     const overheadEffort = totalEffortBase * 0.12; 
     const baseWithOverhead = totalEffortBase + overheadEffort;
     const bufferEffort = baseWithOverhead * deliveryModel.bufferPercent;
     const grandTotalEffort = baseWithOverhead + bufferEffort;
 
-    const budgetTotal = grandTotalEffort * blendedRate;
+    let totalCostBase = 0;
+    if (deliveryModel.costingMethod === 'detailed') {
+      totalCostBase = wbsItems.filter(i => i.isLeaf).reduce((acc, item) => {
+        const matchingRole = rateCard.find(r => r.role === item.role);
+        let itemBlendedRate = globalBlendedRate;
+        if (matchingRole) {
+          const onHr = parseFloat(matchingRole.onshoreHr) || 0;
+          const offHr = matchingRole.offshoreHr === '—' ? 0 : (parseFloat(matchingRole.offshoreHr) || 0);
+          const rBlendedHr = (onHr * (1 - deliveryModel.offshoreRatio)) + (offHr * deliveryModel.offshoreRatio);
+          itemBlendedRate = rBlendedHr * deliveryModel.hoursPerDay;
+        }
+        return acc + ((parseFloat(item.effort) || 0) * mult * itemBlendedRate);
+      }, 0);
+    } else {
+      totalCostBase = totalEffortBase * globalBlendedRate;
+    }
+
+    const effectiveGlobalRate = totalEffortBase > 0 ? (totalCostBase / totalEffortBase) : globalBlendedRate;
+    
+    const overheadCost = overheadEffort * effectiveGlobalRate;
+    const bufferCost = bufferEffort * effectiveGlobalRate;
+    const budgetTotal = totalCostBase + overheadCost + bufferCost;
 
     const roleEfforts = wbsItems.filter(i => i.isLeaf).reduce((acc, item) => {
       const role = item.role || 'Unassigned';
-      acc[role] = (acc[role] || 0) + (parseFloat(item.effort) || 0);
+      acc[role] = (acc[role] || 0) + (parseFloat(item.effort) || 0) * mult;
       return acc;
     }, {});
 
-    const resourceDistribution = Object.entries(roleEfforts).map(([name, value]) => ({ name, value }))
-      .sort((a, b) => b.value - a.value);
+    const resourceDistribution = Object.entries(roleEfforts).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value);
 
     const getPhaseCost = (phaseNum) => {
       const baseCost = wbsItems
         .filter(item => item.isLeaf && item.phase && item.phase.toString().includes(phaseNum.toString()))
         .reduce((acc, item) => {
           const phases = item.phase.toString().split('-').length || 1;
-          const perPhaseEffort = (parseFloat(item.effort) || 0) / phases;
-          return acc + (perPhaseEffort * blendedRate);
+          const perPhaseEffort = ((parseFloat(item.effort) || 0) * mult) / phases;
+          
+          let itemBlendedRate = effectiveGlobalRate;
+          if (deliveryModel.costingMethod === 'detailed') {
+            const matchingRole = rateCard.find(r => r.role === item.role);
+            if (matchingRole) {
+              const onHr = parseFloat(matchingRole.onshoreHr) || 0;
+              const offHr = matchingRole.offshoreHr === '—' ? 0 : (parseFloat(matchingRole.offshoreHr) || 0);
+              const rBlendedHr = (onHr * (1 - deliveryModel.offshoreRatio)) + (offHr * deliveryModel.offshoreRatio);
+              itemBlendedRate = rBlendedHr * deliveryModel.hoursPerDay;
+            }
+          }
+          return acc + (perPhaseEffort * itemBlendedRate);
         }, 0);
       return baseCost * 1.12 * (1 + deliveryModel.bufferPercent);
     };
@@ -153,7 +228,7 @@ export const useStore = () => {
     return {
       avgOnshorePd: avgOnshoreHr * deliveryModel.hoursPerDay,
       avgOffshorePd: avgOffshoreHr * deliveryModel.hoursPerDay,
-      blendedRate: blendedRate || 0,
+      blendedRate: effectiveGlobalRate || 0,
       totalEffort: grandTotalEffort || 0,
       wbsTotalEffort: totalEffortBase,
       overheadEffort: overheadEffort,
@@ -188,6 +263,11 @@ export const useStore = () => {
     updateRate,
     addWbsItem,
     deleteWbsItem,
+    addRateItem,
+    deleteRateItem,
+    savedScenarios,
+    saveScenario,
+    loadScenario,
     importWbsData
   };
 };
